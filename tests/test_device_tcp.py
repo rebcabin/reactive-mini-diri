@@ -1,5 +1,5 @@
-from device_server import tcp_example
+from device_server import tcp_device_server
 
 
-def test_tcp_example():
-    tcp_example()
+def test_tcp_server():
+    tcp_device_server()

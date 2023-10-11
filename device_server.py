@@ -14,16 +14,17 @@ from reactivex.scheduler.eventloop import AsyncIOScheduler
 #                "obn"   observation, event, data packet, item
 
 
-def tcp_example():
+def tcp_device_server():
 
     EchoItem = namedtuple(
-        'EchoItem', ['future', 'data'])
+        typename='EchoItem',
+        field_names=['future', 'data'])
 
-    def my_tcp_server_obl(sbj, aioloop):
+    def tcp_device_server_obl(sbj, aioloop):
         def on_subscribe(obr, _unused_scheduler):
             async def client_connected_callback(reader, writer):
                 """Passed to asyncio.start_server."""
-                print("New client connected.")
+                print("Device server is now listening to the model-client.")
                 while True:
                     data = await reader.readline()
                     data = data.decode("utf-8")
@@ -35,9 +36,10 @@ def tcp_example():
                         future=future,
                         data=data
                     ))
+
                     await future
                     writer.write(future.result().encode("utf-8"))
-                print("Close the client socket's writer.")
+                print("Close the model-client socket's writer.")
                 writer.close()
                 print("Complete the subject.")
                 sbj.on_completed()
@@ -48,7 +50,7 @@ def tcp_example():
                 nm_tup.future.set_result(nm_tup.data)
 
             print()
-            print("Start server.")
+            print("Start device-side server.")
             server = asyncio.start_server(
                 client_connected_cb=client_connected_callback,
                 host='127.0.0.1',
@@ -57,7 +59,7 @@ def tcp_example():
 
             def sink_completed():
                 """Because I can't define a lambda with two statements."""
-                print("Stop the asyncio loop.")
+                print("Stop the Async-IO loop.")
                 aioloop.stop()
                 obr.on_completed()
                 return
@@ -72,7 +74,7 @@ def tcp_example():
 
     my_loop = asyncio.new_event_loop()
     my_sbj = Subject()
-    source_obl = my_tcp_server_obl(
+    source_obl = tcp_device_server_obl(
         sbj=my_sbj,
         aioloop=my_loop)
     aio_scheduler = AsyncIOScheduler(loop=my_loop)
@@ -84,5 +86,5 @@ def tcp_example():
     ).subscribe(my_sbj, scheduler=aio_scheduler)
 
     my_loop.run_forever()
-    print("Loop ended by 'stop.'")
+    print("Async-IO loop ended by 'stop.'")
     my_loop.close()
