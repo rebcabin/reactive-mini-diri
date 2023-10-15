@@ -1,3 +1,55 @@
+"""By Brian Beckman, October 2023
+
+Adapted and clarified from the sample in the RxPy docs:
+https://rxpy.readthedocs.io/en/latest/get_started.html
+This preamble does not include information about 'the device.'
+
+This file is MIT-licensed, like RxPy.
+
+1. Create a `Subject` -- both observable and observer -- named `proxy`. Pass it
+   to `tcp_dev_svr_obl` for later manipulation. Inside `tcp_dev_svr_obl`,
+   `proxy` is named `chain_sink`. Also pass a new AsyncIO loop to
+   `tcp_dev_svr_obl`, which saves the loop for later manipulation.
+
+2. `tcp_dev_svr_obl` creates and returns an observable by calling
+   `reactivex.create` on an internal procedure, `on_subscribe`. `on_subscribe`
+   has the proxy and the AsyncIO loop in scope in the closed-over variables
+   `chain_sink` and `aioloop`. `reactivex.create` registers `on_subscribe` as a
+   hook to call when any chain of observables containing the created observable
+   is subscribed. `on_subscribe` is invoked later in Step 5.
+
+3. Bind the observable returned by `tcp_dev_svr_obl` to the variable
+   `source_obl`.
+
+4. Create an anonymous observable chain with a _map_ and a _delay_ (and
+   possibly more, as this example grows) piped after `source_obl`. Subscribe an
+   observer to the anonymous observable. That observer is the `Observer`
+   interface of our self-same `proxy` -- a `Subject`, therefore both an
+   observer and an observable. That observer receives events from the end of
+   the chain.
+
+5. As a side-effect of subscribing to the chain, `on_subscribe` of
+   `tcp_observable` is invoked with an observer argument. Though `proxy` was
+   passed to `subscribe`, `on_subscribe` receives an observer that feeds events
+   only to the first element of the chain from the AsyncIO reader.
+
+6. Bind the observer argument of `on_subscribe` to the variable named `source`.
+   There are now two observers in scope, `chain_sink` -- the original `proxy` --
+   and `source`. Post events from the client via the AsyncIO reader to the front
+   of the chain by calling `on_next` of `source`. Receive events from the end of
+   the chain by subscribing an observer to `chain_sink` whose `on_next` posts
+   them to the AsyncIO writer and back to the client.
+
+7. Subscribe an anonymous observer to `chain_sink` -- not to `source`.
+   `chain_sink`, as an observable, delivering events from the tail of the
+   observable pipeline, aka chain. The anonymous observer forwards chain output
+   to the AsyncIO writer, and thus to the client, through its `on_next` method.
+   The anonymous observer forwards errors to the system-supplied `on_error` of
+   `source`. Finally, the `on_completed` of that observer stop the AsyncIO loop
+   and then completes `source` to shut down the observable chain.
+
+"""
+
 from collections import namedtuple
 
 import asyncio
@@ -9,129 +61,151 @@ from reactivex.abc import (
     ObserverBase,
     SchedulerBase,
     DisposableBase,
-    # ObservableBase,
 )
 
 import reactivex.operators as ops
 
 from reactivex import (
-    # Observer,
     Observable,
 )
+
 from reactivex.disposable          import Disposable
-# from reactivex.scheduler.scheduler import Scheduler
 from reactivex.subject             import Subject
 from reactivex.scheduler.eventloop import AsyncIOScheduler
 
 
 # # Abbreviations:
 # - `dev`  device       interface to baryon or a machine or belex-libs
-# - `svr`  server       responds to requests from a telnet client.
-# - `obr`  observer     exposes `on_next`, `on_completed`, `on_error`
-# - `obl`  observable   exposes `subscribe`
-# - `sbj`  subject      both an observer and observable
+# - `obl`  Observable   exposes `subscribe`
 # - `obn`  observation  notification, event, data packet, item
+# - `obr`  Observer     exposes `on_next`, `on_completed`, `on_error`
+# - `sbj`  Subject      both an Observer and Observable
+# - `svr`  server       responds to requests from a telnet client.
 
 
-# Echo a command received from the client, often `telnet`.
+# Echo a command received from the client, often `telnet`. Include a
+# future for synchronizing writes to the loop and thus to the client.
 EchoItem = namedtuple(
     typename='EchoItem',
     field_names=['future', 'data'])
 
 
 def tcp_device_server() -> None:
-    """Fields requests from clients wanting to use the device.
-    Called from entry point, often pytest."""
+    """Field requests from clients wanting to use the device.
+
+    Called from entry point, often pytest.
+    """
 
     def tcp_dev_svr_obl(
-            sbj     : Subject,
-            aioloop : Any,
+            chain_sink : Subject,
+            aioloop    : Any,
             ) -> Observable[EchoItem]:
-        """Make an observable from a Subject and an asyncio loop.
+        """Make an Observable from a Subject, `chain_sink`, and an AsyncIO
+        loop, `aioloop`. Save `chain_sink` (close over it) for later
+        subscribing by an anonymous observer. Save `aioloop` for later
+        initialization and shutdown of the TCP reader/writer loop.
 
-        `sbj` is a `Subject`, both an observer and an observable. As an
-        observer, it exposes `on_next`, `on_completed`, `on_error`. As an
-        observable, it exposes `subscribe(some_other_observer)`.
+        The observable eventually becomes the head of an anonymous chain of
+        observables constructed near the end of the main script below.
 
-        This routine, itself, becomes an observable via `rx.create`, which this
-        routine calls on the `on_subscribe` function below, returning the
-        result.
-
-                        +-----------------+
-        sbj:Subject --> |                 |
-        aioloop:Any --> | tcp_dev_svr_obl | --> obl: Observable[Item]
-                        |                 |
-                        +-----------------+
+        A `Subject` is both an observer and an observable. As an observer, it
+        exposes `on_next(event)`, `on_completed()`, `on_error()`. As an
+        observable, it exposes `subscribe(some_observer)`.
         """
-        def on_subscribe(obr : ObserverBase[EchoItem],
-                         _   : SchedulerBase) -> DisposableBase:
-            """Subscribe some observer 'obr' to this observable on this
-            Scheduler. This observer is a wrapped version of the observer
-            interface of my_sbj, thought that fact is not readily or lexically
-            lexically evident.
+
+        def on_subscribe(
+                source : ObserverBase[EchoItem],
+                _      : SchedulerBase
+        ) -> DisposableBase:
+            """Receive an observer that can forward data to the head of a chain
+            of observables. This observer is not the same as 'the anonymous
+            observer,' nor is it `chain_sink`, aka `proxy`, which forwards data
+            from the end of the chain to its observers.
+
+            `Source` is an observer created by side-effect when `proxy`
+            subscribes to the anonymous chain of observables.
+
+            Ignore the Scheduler argument.
             """
 
             async def asyncio_client_connected_callback(
                     reader: asyncio.StreamReader,
                     writer: asyncio.StreamWriter):
-                """Passed to asyncio.start_server, which passes here a
-                StreamReader and a StreamWriter. See
+                """Pass this callback to asyncio.start_server, which
+                passes a StreamReader and a StreamWriter back here. See
                 https://docs.python.org/3.5/library/asyncio-stream.html
+
+                The reader feeds data from the client TCP connection to the
+                `on_next` method of `source`.
                 """
 
-                print("Device server is now listening to the model-client.")
-                # initial, one-time message to the client:
-                writer.write('Any command beginning with "q" '
-                'will terminate the session\n'.encode('utf-8'))
+                await initialization_messages(writer)
+
                 while True:
                     # Text arrives from client here:
-                    data = await reader.readline()
-                    data = data.decode("utf-8")
+
+                    data_awaited = await reader.readline()
+                    data = data_awaited.decode("utf-8")
 
                     if not data or data[0] == 'q':
                         break
 
-                    future = asyncio.Future()
+                    # Invoke some futures later with data to write back to the
+                    # client.
 
-                    # Percolate the observation `value`; eventually ends up
-                    # in the `on_next` of `my_subj`.
-                    obr.on_next(value=EchoItem(
-                        future=future,
-                        data=data
-                    ))
+                    chain_sink_future = asyncio.Future()
+                    source_future = asyncio.Future()
 
-                    await future
+                    # Bypass the processing chain.
+                    chain_sink.on_next(
+                        value=EchoItem(
+                            data = f'received {data} Processing ...\n',
+                            future = chain_sink_future,
+                        ))
 
-                    # When the aioloop is ready, write the `EchoItem` data
-                    # back to the client.
+                    # Go through the processing chain.
+                    source.on_next(value=EchoItem(
+                        future=source_future,
+                        data=data.upper()
+                        ))
 
-                    writer.write(future.result().encode("utf-8"))
+                    # When futures return control here, write the `EchoItem`
+                    # data back to the client.
 
-                # `break` above jumps here:
-                print("Close the model-client socket's writer.")
+                    await chain_sink_future
+                    writer.write(chain_sink_future.result().encode("utf-8"))
+
+                    await source_future
+                    writer.write(source_future.result().encode("utf-8"))
+
+                # Any command beginning with `q` jumps here:
+                print("Close the aioloop writer.")
+
+                # Close the writer, here, because `writer` will be out of scope
+                # when `chain_sink.on_completed` is invoked.
                 writer.close()
+
                 # The reader cannot be closed.
-                print("Complete the subject.")
-                sbj.on_completed()
-                print("Complete the observer.")
-                obr.on_completed()
 
-            def sink_on_next(obn: EchoItem):
-                """
-                Eventually called via the above `obr.on_next`."""
-                obn.future.set_result(obn.data)
+                # Let `chain_sink.on_completed` shut down the loop and
+                # the `source`.
+                print("Complete the proxy Subject, eventually completing `source`.")
+                chain_sink.on_completed()
 
-            def sink_on_completed():
-                """Because I can't define a lambda with two statements."""
-                print("Stop the Async-IO loop.")
-                aioloop.stop()
-                print("observer.on_completed()")
-                obr.on_completed()
-                return
+                pass  # end of `asyncio_client_connected_callback`
 
-            # `on_subscribe` starts executing here:
+            # `reader` and `writer are now out of scope`.
+
+            async def initialization_messages(writer):
+                # to server console.
+                print("Device server is now listening to the client.")
+                # to client:
+                writer.write('Any command beginning with "q"'
+                             'terminates the session.\n'.encode('utf-8'))
+
+            # `on_subscribe` with `source` observer starts executing here:
             print()
-            print("OnSubscribe: start device-side asyncio server"
+            print("OnSubscribe: start device-side asyncio server "
             "on localhost:8888.")
             server : Coroutine[Any, Any, asyncio.Server] = \
                 asyncio.start_server(
@@ -141,38 +215,34 @@ def tcp_device_server() -> None:
             print("Server now running as as asyncio task.")
             aioloop.create_task(server)
 
-            # Subscribe an anonymous observer to `my_sbj`. That observer
-            # forwards to the `on_next` above and `on_completed` to
-            # `sink_completed` above. See below for the full diagram.
-            #
-            #       \_/
-            #        | obr
-            #        |
-            #        |   +---------------------+
-            #        `---| anonymous observer  |
-            #            | - sink_on_next      |
-            #            | - sink_on_completed |
-            #            +---------------------+
+            # Subscribe an anonymous Observer to `proxy`, aka `chain_sink`.
+            # The `on_next` of that observer forwards events to the TCP writer,
+            # which is waiting for the future saved in the event data structure
+            # -- the "observation."
 
-            sbj.subscribe(
-                on_next=sink_on_next,
-                on_error=obr.on_error,
-                on_completed=sink_on_completed
-                # on_completed=lambda: aioloop() or obr.on_completed()
-                # lambda above doesn't work; reason unknown
+            chain_sink.subscribe(
+                # Event data are sent to the writer of aioloop.
+                on_next=lambda obn: obn.future.set_result(obn.data),
+                # Forward errors to the source observer.
+                on_error=source.on_error,
+                # This next lambda works because both disjuncts return `None`.
+                on_completed=lambda: aioloop.stop() or source.on_completed(),
               )
 
             # The following un-hooked Disposable is here just to satisfy the
             # type-checker. Actual resources are shut down and released in
             # `sink_completed` above.
 
-            return Disposable()
+            return Disposable()  # end of `on_subscribe`
 
-        # The `on_subscribe` routine above is invoked later.
+        # `tcp_dev_svr_obl` starts executing here.
+
+        # The `on_subscribe` routine above is invoked later by side-effect
+        # when an observers subscribes to the observable chain.
 
         result : Observable[EchoItem] = rx.create(on_subscribe)
 
-        return result
+        return result # end of `tcp_dev_svr_obl`.
 
     #              _                   _      _
     #   _ __  __ _(_)_ _    ___ __ _ _(_)_ __| |_
@@ -182,52 +252,64 @@ def tcp_device_server() -> None:
 
     # main script, invoked by pytest, for example
 
-    # Create a `Subject`, which is both an observer and an observable. Its
-    # observer starts off with `noop` for its on_next and on_completed methods.
-    # Its observable starts off with `subscribe` for its subscribe method,
-    # which dispatches to `on_subscribe` above.
+    # Make arguments to pass to `tcp_dev_svr_obl`.
 
-    my_sbj = Subject()
+    # Create a `Subject`, `proxy`, to forward data from the tail of a chain of
+    # observables to its subscribers. `Proxy` is both an observable and an
+    # observer. Its observable starts off with the system-default `subscribe`
+    # method. That method automatically calls our hook, `on_subscribe`, above,
+    # with a system-supplied observer whose `on_next` forwards data to the
+    # source observable created below.
 
-    # Make an asyncio loop to feed and an observable, but don't run them yet.
-    # `source_obl` takes `my_sbj` as its argument and hooks up its observer
-    # interface in
+    proxy = Subject()
+
+    # Make an asyncio loop to produce data from the client and to consumer data
+    # to send back to the client. Don't run the loop yet.
 
     my_loop = asyncio.new_event_loop()
 
     source_obl = tcp_dev_svr_obl(
-        sbj=my_sbj,
+        chain_sink=proxy,
         aioloop=my_loop)
-    aio_scheduler = AsyncIOScheduler(loop=my_loop)
 
-    # Make a new, anonymous observable and subscribe `my_sbj` to it.
-    # Internally, `subscribe` wraps `my_sbj` with another Observer that retains
-    # on_* methods that have not been overridden. The chain ends up looking
-    # like this:
+    # Chain `source_obl` to a few queries (observable-to-observable transforms,
+    # e.g., `map` and `delay`). . Subscribe `proxy` to the tail of the chain on
+    # an `AsyncIOScheduler`. The chain ends up looking like this:
     #
-    #    ,-- anonymous observable chain ------------------------.
-    #               event            event         event
-    #   +---------+       +--------+       +-----+       +-------+ obl  \ obr
-    #   | asyncio |---,   | source |---,   | map |---,   | delay |-----o |---.
-    #   |  loop   |   `-->|  obl   |   `-->|     |   `-->|       |      /    |
-    #   +---------+       +--------|       +-----+       +-------+           |
-    #                                                                        |
-    #            observable interface    +--------+    observer interface    |
-    #        o---------------------------| my_sbj |--------------------------'
-    #       \_/                          +--------+
-    #        | obr
-    #        |
-    #        |   +---------------------+
-    #        `---| anonymous observer  |
-    #            | - sink_on_next      |
-    #            | - sink_on_completed |
-    #            +---------------------+
+    #     ,------ anonymous observable chain -------------------.
+    #    /                                                       \
+    #
+    #                                event         event
+    #    /-------\       +---------+       +-----+       +-------+
+    #   | reader  |>     | source  |---,   | map |---,   | delay |
+    #   +-asyncio-+ \    |   obl   |   `-->| obl |   `-->|  obl  |
+    #   | writer  |  \   +---------|       +-----+       +-------+
+    #    \-------/    \       ^                              |
+    #        ^ ^    on_next   |   created via            obl |
+    #        |  \       \     |   reactivex.create           |
+    #  to the|   \       V    |   of source_obl              |
+    #  writer|    \       +--------+ Step 5                  o
+    #        |     \      | source |          subscription  \_/
+    #        |    loop.   |  obr   |                         |
+    #        |     stop   +--------+                     obr |
+    #        |        \      ^  ^                     Step 4 |
+    #        |         ^     |  |                     +-------------+
+    #        |   on_completed|  |on_error             | chain_sink  |
+    #        |               |  |                     |  aka proxy  |
+    #        |               |  |                     +-------------+
+    #        |         +----------------------+              |
+    #        \         |                      | obr        _ | obl
+    #         `--------|  anonymous observer  |-----------|  o
+    #          on_next |                      |            -
+    #                  +----------------------+        subscription
 
+    aio_scheduler = AsyncIOScheduler(loop=my_loop)
+    # Anonymous Observable
     source_obl.pipe(
         # _replace is a protected method in named-tuple
-        ops.map(lambda obn: obn._replace(data="echo: {}".format(obn.data))),
+        ops.map(lambda obn: obn._replace(data=f"echo: {obn.data}")),
         ops.delay(0.5)
-    ).subscribe(my_sbj, scheduler=aio_scheduler)
+    ).subscribe(proxy, scheduler=aio_scheduler)
 
     # Start feeding events into the chain.
 
